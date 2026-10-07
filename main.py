@@ -45,7 +45,8 @@ class AckRequest(BaseModel):
     consumer_group: str
     consumer_id: str
     lease_token: str
-    result_offset: int
+    result_offset: int | None = None  # optional, legacy compatibility only
+    result: Any = None  # processing output stored with the succeeded job
 
 
 class NackRequest(BaseModel):
@@ -53,6 +54,7 @@ class NackRequest(BaseModel):
     lease_token: str
     error: str
     retryable: bool = True
+    consumer_group: str | None = None  # when set, terminal nacks advance the checkpoint
 
 
 def _job_view(job) -> dict[str, Any]:
@@ -69,6 +71,7 @@ def _job_view(job) -> dict[str, Any]:
         "visible_at": job.visible_at,
         "lease_owner": job.lease_owner,
         "lease_expires_at": job.lease_expires_at,
+        "result": job.result,
     }
 
 
@@ -114,7 +117,14 @@ def lease_job(req: LeaseRequest):
 
 @app.post("/jobs/{job_id}/ack")
 def ack_job(job_id: str, req: AckRequest):
-    result = queue.ack(req.consumer_group, req.consumer_id, job_id, req.lease_token, req.result_offset)
+    result = queue.ack(
+        req.consumer_group,
+        req.consumer_id,
+        job_id,
+        req.lease_token,
+        req.result_offset,
+        req.result,
+    )
     if result is AckResult.OK:
         return {"result": result.value}
     raise HTTPException(status_code=409, detail={"result": result.value})
@@ -122,7 +132,14 @@ def ack_job(job_id: str, req: AckRequest):
 
 @app.post("/jobs/{job_id}/nack")
 def nack_job(job_id: str, req: NackRequest):
-    result = queue.nack(req.consumer_id, job_id, req.lease_token, req.error, retryable=req.retryable)
+    result = queue.nack(
+        req.consumer_id,
+        job_id,
+        req.lease_token,
+        req.error,
+        retryable=req.retryable,
+        consumer_group=req.consumer_group,
+    )
     if result is AckResult.OK:
         return {"result": result.value}
     raise HTTPException(status_code=409, detail={"result": result.value})

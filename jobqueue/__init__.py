@@ -5,8 +5,10 @@ from .models import (
     AckResult,
     Job,
     JobStatus,
+    Lease,
     SubmitResult,
     SubmitStatus,
+    TerminalReason,
 )
 from .queue import JobQueue
 
@@ -15,7 +17,9 @@ __all__ = [
     "Job",
     "JobQueue",
     "JobStatus",
+    "Lease",
     "QueueConfig",
     "SubmitResult",
     "SubmitStatus",
+    "TerminalReason",
 ]

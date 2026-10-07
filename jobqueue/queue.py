@@ -7,10 +7,27 @@ Delivery semantics
   the lease expires, otherwise the job is automatically re-queued and may
   be delivered again.
 * A job is leased to exactly one consumer at a time (lease token +
-  expiry), so it is never executed concurrently twice.
-* The per-group checkpoint only advances when an ``ack`` passes all
-  validations; regressions, out-of-bounds and out-of-order offsets are
-  rejected explicitly.
+  expiry), so it is never executed concurrently twice.  Once a job has
+  reached a terminal state (SUCCEEDED / DEAD) it is never delivered again
+  and any late or duplicate ack/nack is rejected with ALREADY_COMPLETED.
+
+Completion semantics (out-of-order completion)
+----------------------------------------------
+* A valid ack/nack settles the *job itself* immediately, independently of
+  earlier offsets: a succeeded job becomes SUCCEEDED (with its result
+  queryable) and a definitively failed job becomes DEAD even while jobs
+  with smaller offsets are still in flight.
+* The per-group checkpoint is the *contiguous completion boundary*: after
+  every settlement it advances across every consecutive terminal job from
+  the committed offset and stops at the first unfinished "hole".  When the
+  hole is later settled, the boundary automatically advances over the
+  already-settled jobs behind it -- nothing is re-run.
+* The checkpoint therefore never skips a non-terminal job and never moves
+  backwards.  Out-of-order, duplicate, or repeated acknowledgements cannot
+  corrupt it.
+* Legacy callers may still pass ``result_offset`` with ack: it is validated
+  for compatibility (regression / mismatch rejected) but no longer drives
+  the checkpoint -- the contiguous boundary does.
 """
 
 from __future__ import annotations
@@ -18,6 +35,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from typing import Any
 
 from .config import QueueConfig
 from .models import (
@@ -151,43 +169,54 @@ class JobQueue:
         consumer_id: str,
         job_id: str,
         lease_token: str,
-        result_offset: int,
+        result_offset: int | None = None,
+        result: Any = None,
         now: float | None = None,
     ) -> AckResult:
-        """Acknowledge successful processing and advance the checkpoint.
+        """Acknowledge successful processing.
 
-        The checkpoint moves to ``result_offset`` only when every check
-        passes: job exists, lease is valid and held by this consumer, the
-        offset matches the acked job, does not regress, does not exceed
-        any assigned offset, and every earlier job is already terminal.
+        The job settles to SUCCEEDED immediately and stores ``result`` --
+        regardless of whether smaller-offset jobs have already settled.
+        Afterwards the group checkpoint advances to the contiguous
+        completion boundary (see module docstring).
+
+        ``result_offset`` is accepted for backwards compatibility and, when
+        given, is still validated: a value at or below the committed
+        checkpoint is CHECKPOINT_REGRESSION and a value that does not match
+        the acked job's offset is CHECKPOINT_OUT_OF_ORDER.  It never drives
+        the checkpoint by itself.
         """
         now = self._now(now)
         with self._lock:
             job = self._store.get_job(job_id)
             if job is None:
                 return AckResult.NOT_FOUND
+            # an already settled job can never be acknowledged again, not
+            # even by a late consumer holding an old token
+            if job.status in _TERMINAL_STATUSES:
+                return AckResult.ALREADY_COMPLETED
             lease_check = self._check_lease(job, consumer_id, lease_token, now)
             if lease_check is not AckResult.OK:
                 return lease_check
 
-            checkpoint = self._store.get_checkpoint(consumer_group)
-            if result_offset <= checkpoint:
-                return AckResult.CHECKPOINT_REGRESSION
-            if result_offset != job.offset:
-                return AckResult.CHECKPOINT_OUT_OF_ORDER
-            max_offset = self._store.next_offset() - 1
-            if result_offset > max_offset:
-                return AckResult.CHECKPOINT_OUT_OF_ORDER
-            for other in self._store.list_jobs():
-                if other.offset < result_offset and other.status not in _TERMINAL_STATUSES:
+            # legacy offset argument: validated for compatibility only
+            if result_offset is not None:
+                checkpoint = self._store.get_checkpoint(consumer_group)
+                if result_offset <= checkpoint:
+                    return AckResult.CHECKPOINT_REGRESSION
+                if result_offset != job.offset:
+                    return AckResult.CHECKPOINT_OUT_OF_ORDER
+                max_offset = self._store.next_offset() - 1
+                if result_offset > max_offset:
                     return AckResult.CHECKPOINT_OUT_OF_ORDER
 
             job.status = JobStatus.SUCCEEDED
             job.terminal_reason = TerminalReason.SUCCEEDED
             job.last_error = None
+            job.result = result
             self._clear_lease(job, now)
             self._store.update_job(job)
-            self._store.set_checkpoint(consumer_group, result_offset)
+            self._advance_checkpoint_locked(consumer_group)
             return AckResult.OK
 
     def nack(
@@ -198,6 +227,7 @@ class JobQueue:
         error: str,
         *,
         retryable: bool = True,
+        consumer_group: str | None = None,
         now: float | None = None,
     ) -> AckResult:
         """Report a processing failure.
@@ -206,12 +236,19 @@ class JobQueue:
         backoff until ``max_attempts`` deliveries happened, then the job
         goes DEAD with reason RETRIES_EXHAUSTED.  Non-retryable failures
         go DEAD immediately with reason NON_RETRYABLE.
+
+        Reaching a terminal state settles the job immediately; when
+        ``consumer_group`` is supplied the group checkpoint advances to the
+        contiguous completion boundary, so a definitively failed job never
+        blocks later jobs forever.
         """
         now = self._now(now)
         with self._lock:
             job = self._store.get_job(job_id)
             if job is None:
                 return AckResult.NOT_FOUND
+            if job.status in _TERMINAL_STATUSES:
+                return AckResult.ALREADY_COMPLETED
             lease_check = self._check_lease(job, consumer_id, lease_token, now)
             if lease_check is not AckResult.OK:
                 return lease_check
@@ -229,6 +266,8 @@ class JobQueue:
                 job.visible_at = now + self._backoff(job.attempts)
             self._clear_lease(job, now)
             self._store.update_job(job)
+            if consumer_group is not None and job.status in _TERMINAL_STATUSES:
+                self._advance_checkpoint_locked(consumer_group)
             return AckResult.OK
 
     # ------------------------------------------------------------------
@@ -266,6 +305,26 @@ class JobQueue:
                 self._store.update_job(job)
                 count += 1
         return count
+
+    def _advance_checkpoint_locked(self, consumer_group: str) -> int:
+        """Move the checkpoint to the contiguous terminal-job boundary.
+
+        Walks jobs in offset order from the committed offset + 1 and
+        advances while jobs are terminal (SUCCEEDED / DEAD); stops at the
+        first unfinished hole.  The value only ever grows, so concurrent,
+        out-of-order or duplicate settlements can never regress it.
+        """
+        checkpoint = self._store.get_checkpoint(consumer_group)
+        boundary = checkpoint
+        for job in self._store.list_jobs():
+            if job.offset <= checkpoint:
+                continue
+            if job.status not in _TERMINAL_STATUSES:
+                break  # first unfinished job is the hole; boundary stops here
+            boundary = job.offset
+        if boundary > checkpoint:
+            self._store.set_checkpoint(consumer_group, boundary)
+        return boundary
 
     def _check_lease(self, job: Job, consumer_id: str, lease_token: str, now: float) -> AckResult:
         if job.status is not JobStatus.LEASED:

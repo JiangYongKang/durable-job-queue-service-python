@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -33,8 +33,9 @@ class AckResult(str, enum.Enum):
     NOT_FOUND = "not_found"
     NOT_LEASED = "not_leased"  # job is not currently leased (or lease expired)
     LEASE_MISMATCH = "lease_mismatch"  # wrong lease token / consumer
+    ALREADY_COMPLETED = "already_completed"  # job already in a terminal state
     CHECKPOINT_REGRESSION = "checkpoint_regression"  # offset <= committed
-    CHECKPOINT_OUT_OF_ORDER = "checkpoint_out_of_order"  # gaps / unknown offset
+    CHECKPOINT_OUT_OF_ORDER = "checkpoint_out_of_order"  # offset does not match job / out of bounds
 
 
 class TerminalReason(str, enum.Enum):
@@ -65,6 +66,7 @@ class Job:
     last_error: str | None = None
     terminal_reason: TerminalReason = TerminalReason.NONE
     offset: int = 0  # monotonic consumption offset assigned at enqueue time
+    result: Any = None  # processing output stored on success, queryable immediately
 
 
 @dataclass
