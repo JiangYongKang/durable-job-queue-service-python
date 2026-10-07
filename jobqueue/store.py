@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     lease_expires_at REAL,
     last_error       TEXT,
     terminal_reason  TEXT NOT NULL,
-    offset           INTEGER NOT NULL
+    offset           INTEGER NOT NULL,
+    result           TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency_key
     ON jobs (idempotency_key);
@@ -50,6 +51,13 @@ class JobStore:
         self._lock = threading.RLock()
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
+            self._migrate_locked()
+
+    def _migrate_locked(self) -> None:
+        """Bring older database files up to the current schema."""
+        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(jobs)")}
+        if "result" not in cols:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN result TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -64,8 +72,8 @@ class JobStore:
                     job_id, idempotency_key, payload, status, attempts,
                     max_attempts, created_at, updated_at, visible_at,
                     lease_owner, lease_token, lease_expires_at,
-                    last_error, terminal_reason, offset
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_error, terminal_reason, offset, result
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._to_row(job),
             )
@@ -92,7 +100,7 @@ class JobStore:
                     payload = ?, status = ?, attempts = ?, max_attempts = ?,
                     created_at = ?, updated_at = ?, visible_at = ?,
                     lease_owner = ?, lease_token = ?, lease_expires_at = ?,
-                    last_error = ?, terminal_reason = ?, offset = ?
+                    last_error = ?, terminal_reason = ?, offset = ?, result = ?
                 WHERE job_id = ?
                 """,
                 (
@@ -109,6 +117,7 @@ class JobStore:
                     job.last_error,
                     job.terminal_reason.value,
                     job.offset,
+                    json.dumps(job.result, sort_keys=True) if job.result is not None else None,
                     job.job_id,
                 ),
             )
@@ -149,6 +158,22 @@ class JobStore:
                 (consumer_group, offset),
             )
 
+    def ensure_checkpoint(self, consumer_group: str) -> None:
+        """Register a consumer group at offset 0 if it has no row yet."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO checkpoints (consumer_group, offset) VALUES (?, 0)",
+                (consumer_group,),
+            )
+
+    def list_checkpoints(self) -> dict[str, int]:
+        """All consumer-group checkpoints (group -> committed offset)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT consumer_group, offset FROM checkpoints"
+            ).fetchall()
+        return {row["consumer_group"]: int(row["offset"]) for row in rows}
+
     # --- (de)serialisation ------------------------------------------------
     @staticmethod
     def _to_row(job: Job) -> tuple:
@@ -168,6 +193,7 @@ class JobStore:
             job.last_error,
             job.terminal_reason.value,
             job.offset,
+            json.dumps(job.result, sort_keys=True) if job.result is not None else None,
         )
 
     @staticmethod
@@ -188,4 +214,5 @@ class JobStore:
             last_error=row["last_error"],
             terminal_reason=TerminalReason(row["terminal_reason"]),
             offset=row["offset"],
+            result=json.loads(row["result"]) if row["result"] is not None else None,
         )

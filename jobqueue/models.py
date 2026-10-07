@@ -65,6 +65,7 @@ class Job:
     last_error: str | None = None
     terminal_reason: TerminalReason = TerminalReason.NONE
     offset: int = 0  # monotonic consumption offset assigned at enqueue time
+    result: dict[str, Any] | None = None  # processing result recorded at ack time
 
 
 @dataclass

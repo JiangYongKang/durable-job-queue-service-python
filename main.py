@@ -46,6 +46,7 @@ class AckRequest(BaseModel):
     consumer_id: str
     lease_token: str
     result_offset: int
+    result: dict[str, Any] | None = None
 
 
 class NackRequest(BaseModel):
@@ -66,6 +67,7 @@ def _job_view(job) -> dict[str, Any]:
         "offset": job.offset,
         "last_error": job.last_error,
         "terminal_reason": job.terminal_reason.value,
+        "result": job.result,
         "visible_at": job.visible_at,
         "lease_owner": job.lease_owner,
         "lease_expires_at": job.lease_expires_at,
@@ -114,7 +116,7 @@ def lease_job(req: LeaseRequest):
 
 @app.post("/jobs/{job_id}/ack")
 def ack_job(job_id: str, req: AckRequest):
-    result = queue.ack(req.consumer_group, req.consumer_id, job_id, req.lease_token, req.result_offset)
+    result = queue.ack(req.consumer_group, req.consumer_id, job_id, req.lease_token, req.result_offset, result=req.result)
     if result is AckResult.OK:
         return {"result": result.value}
     raise HTTPException(status_code=409, detail={"result": result.value})
